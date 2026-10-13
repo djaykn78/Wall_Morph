@@ -33,6 +33,213 @@ from transformations import (
     bring_forward, send_backward, bring_to_front, send_to_back, get_corners,
 )
 
+# ──────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ──────────────────────────────────────────────────────────────────────────
+
+_PROJECT_DIR = Path(__file__).resolve().parent
+
+def read_asset(path):
+    """Load an image asset from a path (absolute or relative to the project directory).
+
+    Returns the image as a BGR numpy array (OpenCV format).
+    Supports PNG (with alpha), JPG, and WEBP.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = _PROJECT_DIR / p
+    p = p.resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Asset not found: {p}")
+    image = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"Could not decode asset: {p}")
+    return image
+
+
+def remove_object_from_image(image, obj):
+    """Remove an object from the image by inpainting the region with surrounding wall content.
+
+    Uses OpenCV's inpainting algorithm (Telea method) to fill the object's bounding
+    box with content that blends seamlessly with the surrounding wall.
+    This is a matrix operation: the inpainting mask is a binary matrix marking the
+    region to be filled, and the algorithm uses neighbouring pixel values to
+    reconstruct the missing area.
+    """
+    result = image.copy()
+    h, w = result.shape[:2]
+    # Create inpainting mask from the object's bounding box
+    mask = np.zeros((h, w), dtype=np.uint8)
+    x1 = max(0, int(obj["x"]))
+    y1 = max(0, int(obj["y"]))
+    x2 = min(w, x1 + int(obj["width"]))
+    y2 = min(h, y1 + int(obj["height"]))
+    mask[y1:y2, x1:x2] = 255
+    # Use Telea inpainting with a radius proportional to the object size
+    # for natural-looking wall reconstruction
+    inpaint_radius = max(3, min(15, int(min(obj["width"], obj["height"]) * 0.05)))
+    result = cv2.inpaint(result, mask, inpaint_radius, cv2.INPAINT_TELEA)
+    return result
+
+
+def composite_design(canvas_bgr, asset_path, obj):
+    """Render an asset using the current geometry, rotation, and optional perspective quad."""
+    asset = read_asset(asset_path)
+    if asset.ndim == 2:
+        asset = cv2.cvtColor(asset, cv2.COLOR_GRAY2BGRA)
+    elif asset.shape[2] == 3:
+        asset = cv2.cvtColor(asset, cv2.COLOR_BGR2BGRA)
+    ah, aw = asset.shape[:2]
+    H, W = canvas_bgr.shape[:2]
+    quad = obj.get("quad")
+    if quad and len(quad) == 4:
+        src = np.float32([[0, 0], [aw - 1, 0], [aw - 1, ah - 1], [0, ah - 1]])
+        dst = np.float32(quad)
+        transform = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(asset, transform, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        base = canvas_bgr.astype(np.float32)
+        rgb = warped[:, :, :3].astype(np.float32)
+        out = rgb * alpha + base * (1.0 - alpha)
+        return np.clip(out, 0, 255).astype(np.uint8)
+    rgba = cv2.cvtColor(asset, cv2.COLOR_BGRA2RGBA)
+    overlay = Image.fromarray(rgba).resize((max(1, int(obj["width"])), max(1, int(obj["height"]))), Image.Resampling.LANCZOS)
+    angle = float(obj.get("rotation", 0))
+    if angle:
+        overlay = overlay.rotate(-angle, expand=True, resample=Image.Resampling.BICUBIC)
+    base = Image.fromarray(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGBA))
+    x, y = int(obj["x"]), int(obj["y"])
+    x -= (overlay.width - int(obj["width"])) // 2
+    y -= (overlay.height - int(obj["height"])) // 2
+    base.alpha_composite(overlay, (x, y))
+    return cv2.cvtColor(np.array(base.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
+def render_scene(base_image, objects):
+    """Render registered object designs from current object geometry over the wall canvas."""
+    out = base_image.copy()
+    for obj in objects:
+        design_id = obj.get("design")
+        if not design_id:
+            continue
+        design = get_design(design_id)
+        if design:
+            try:
+                out = composite_design(out, design["path"], obj)
+            except (FileNotFoundError, ValueError) as exc:
+                # Keep the rest of the scene visible if one optional asset is broken.
+                log_message = f"Could not render {design_id}: {exc}"
+                st.warning(log_message)
+    return out
+
+
+def render_object_boxes(image, objects):
+    """Draw visible, rotation-aware object outlines and labels."""
+    out = image.copy()
+    for obj in objects:
+        color = (45, 190, 90) if obj.get("source") == "automatic" else (30, 150, 240)
+        corners = np.round(obj.get("quad") if obj.get("quad") and len(obj["quad"]) == 4 else get_corners(obj)).astype(np.int32)
+        cv2.polylines(out, [corners], True, color, 2, cv2.LINE_AA)
+        if obj.get("quad") and len(obj["quad"]) == 4:
+            for px, py in corners:
+                cv2.circle(out, (int(px), int(py)), 5, color, -1, cv2.LINE_AA)
+        label = f'{obj.get("type", "object")} #{obj.get("id", "?")} · {int(obj.get("rotation", 0))}°'
+        anchor_x = int(max(0, min(corners[:, 0].min(), out.shape[1] - 1)))
+        anchor_y = int(max(18, min(corners[:, 1].min() - 6, out.shape[0] - 2)))
+        cv2.putText(out, label, (anchor_x, anchor_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    return out
+
+
+def push_snapshot():
+    """Save the current edit state to undo history, trimming redo states."""
+    # Refresh geometry widget keys on the next rerun so controls never show stale values.
+    st.session_state.geometry_revision = int(st.session_state.get("geometry_revision", 0)) + 1
+    state = {"image": st.session_state.canvas.copy(), "objects": copy.deepcopy(st.session_state.objects)}
+    history = st.session_state.history
+    cursor = st.session_state.history_cursor
+    history = history[: cursor + 1]
+    history.append(state)
+    if len(history) > 30:
+        history = history[-30:]
+    st.session_state.history = history
+    st.session_state.history_cursor = len(history) - 1
+
+
+def restore_snapshot(index):
+    snap = st.session_state.history[index]
+    st.session_state.canvas = snap["image"].copy()
+    st.session_state.objects = copy.deepcopy(snap["objects"])
+    st.session_state.history_cursor = index
+
+
+def reset_state(image):
+    st.session_state.original = image.copy()
+    st.session_state.canvas = image.copy()
+    st.session_state.objects = []
+    st.session_state.history = [{"image": image.copy(), "objects": []}]
+    st.session_state.history_cursor = 0
+    st.session_state.wall_points = ""
+    st.session_state.selected_id = None
+    st.session_state.geometry_revision = int(st.session_state.get("geometry_revision", 0)) + 1
+
+
+def clamp_object_to_image(obj, image_width, image_height):
+    """Keep object geometry valid even when a detector returns off-image boxes."""
+    item = copy.deepcopy(obj)
+    width = max(1, min(int(round(float(item.get("width", 1)))), image_width))
+    height = max(1, min(int(round(float(item.get("height", 1)))), image_height))
+    x = int(round(float(item.get("x", 0))))
+    y = int(round(float(item.get("y", 0))))
+    item["width"], item["height"] = width, height
+    item["x"] = max(0, min(x, image_width - width))
+    item["y"] = max(0, min(y, image_height - height))
+    item.setdefault("rotation", 0)
+    item.setdefault("scale", 1.0)
+    item.setdefault("design", None)
+    return item
+
+
+def set_object_geometry(objects, object_id, *, x=None, y=None, width=None, height=None, image_width, image_height):
+    """Update one object's geometry while guaranteeing it remains inside the image."""
+    updated = copy.deepcopy(objects)
+    for index, obj in enumerate(updated):
+        if obj.get("id") == object_id:
+            candidate = copy.deepcopy(obj)
+            if x is not None: candidate["x"] = int(x)
+            if y is not None: candidate["y"] = int(y)
+            if width is not None: candidate["width"] = int(width)
+            if height is not None: candidate["height"] = int(height)
+            candidate["width"] = max(1, min(int(candidate["width"]), image_width))
+            candidate["height"] = max(1, min(int(candidate["height"]), image_height))
+            candidate["x"] = max(0, min(int(candidate["x"]), image_width - candidate["width"]))
+            candidate["y"] = max(0, min(int(candidate["y"]), image_height - candidate["height"]))
+            if candidate.get("quad"):
+                sx = candidate["width"] / max(1, int(obj["width"]))
+                sy = candidate["height"] / max(1, int(obj["height"]))
+                dx = candidate["x"] - float(obj["x"]); dy = candidate["y"] - float(obj["y"])
+                candidate["quad"] = [[candidate["x"] + (float(px)-float(obj["x"])) * sx, candidate["y"] + (float(py)-float(obj["y"])) * sy] for px, py in obj["quad"]]
+            updated[index] = candidate
+            break
+    return updated
+
+
+def set_object_rotation(objects, object_id, angle):
+    updated = copy.deepcopy(objects)
+    for obj in updated:
+        if obj.get("id") != object_id: continue
+        old = float(obj.get("rotation", 0)); new = float(angle) % 360
+        if obj.get("quad"):
+            cx = float(obj["x"]) + float(obj["width"]) / 2
+            cy = float(obj["y"]) + float(obj["height"]) / 2
+            delta = np.radians(new - old); c, sn = np.cos(delta), np.sin(delta)
+            points=[]
+            for px, py in obj["quad"]:
+                dx, dy = float(px)-cx, float(py)-cy
+                points.append([cx + dx*c - dy*sn, cy + dx*sn + dy*c])
+            obj["quad"] = points
+        obj["rotation"] = new
+    return updated
+
 # Page configuration
 st.set_page_config(
     page_title="Wall Visualization Studio", 
@@ -152,11 +359,31 @@ original = st.session_state.original
 h, w = original.shape[:2]
 st.caption(f"Image size: {w} × {h} pixels")
 
+# ── Prominent live preview above tabs ──────────────────────────────────────
+st.subheader("🖼️ Live Preview")
+_preview_rendered = render_scene(st.session_state.canvas, st.session_state.objects)
+_preview_col1, _preview_col2 = st.columns(2)
+with _preview_col1:
+    st.image(
+        cv2.cvtColor(st.session_state.original, cv2.COLOR_BGR2RGB),
+        caption="Original",
+        use_container_width=True
+    )
+with _preview_col2:
+    st.image(
+        cv2.cvtColor(_preview_rendered, cv2.COLOR_BGR2RGB),
+        caption="Redesigned",
+        use_container_width=True
+    )
+
+st.divider()
+
 # Main content with tabs
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🔍 Object Detection & Management", 
     "🎨 Wall Finishing", 
-    "📜 History & Export"
+    "📜 History & Export",
+    "🔀 Compare Original & Redesigned"
 ])
 
 # Tab 1: Object Detection & Management
@@ -483,7 +710,7 @@ with tab1:
             push_snapshot()
             st.rerun()
 
-        b1, b2, b3, b4, b5 = st.columns(5)
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
         if b1.button("Duplicate", use_container_width=True):
             duplicate = duplicate_object(selected, st.session_state.objects)
             duplicate = clamp_object_to_image(duplicate, w, h)
@@ -496,15 +723,22 @@ with tab1:
             st.session_state.selected_id = st.session_state.objects[0]["id"] if st.session_state.objects else None
             push_snapshot()
             st.rerun()
-        if b3.button("Bring forward", use_container_width=True):
+        if b3.button("🗑️ Remove from image", use_container_width=True, help="Erase this object from the image and fill with surrounding wall (inpainting)"):
+            st.session_state.canvas = remove_object_from_image(st.session_state.canvas, selected)
+            st.session_state.objects = remove_object(st.session_state.objects, selected_id)
+            st.session_state.selected_id = st.session_state.objects[0]["id"] if st.session_state.objects else None
+            push_snapshot()
+            st.success("Object removed and wall inpainted.")
+            st.rerun()
+        if b4.button("Bring forward", use_container_width=True):
             st.session_state.objects = bring_forward(st.session_state.objects, selected_id)
             push_snapshot()
             st.rerun()
-        if b4.button("Send backward", use_container_width=True):
+        if b5.button("Send backward", use_container_width=True):
             st.session_state.objects = send_backward(st.session_state.objects, selected_id)
             push_snapshot()
             st.rerun()
-        if b5.button("Center object", use_container_width=True):
+        if b6.button("Center object", use_container_width=True):
             st.session_state.objects = set_object_geometry(
                 st.session_state.objects, 
                 selected_id, 
@@ -733,9 +967,15 @@ with tab2:
 
     if wall_mode == "Solid color":
         color_map = get_wall_colours()
-        color_name = st.selectbox("Wall color", list(color_map))
-        # Database RGB values are converted to BGR for OpenCV functions.
-        rgb = color_map[color_name]
+        color_source = st.radio("Color source", ["Predefined palette", "Custom color picker"], horizontal=True, key="color_source_radio")
+        if color_source == "Predefined palette":
+            color_name = st.selectbox("Wall color", list(color_map))
+            # Database RGB values are converted to BGR for OpenCV functions.
+            rgb = color_map[color_name]
+        else:
+            custom_hex = st.color_picker("Pick a custom wall color", value="#E8D5B7", key="custom_wall_color_picker")
+            # Convert hex to RGB tuple
+            rgb = (int(custom_hex[1:3], 16), int(custom_hex[3:5], 16), int(custom_hex[5:7], 16))
         wall_color_bgr = (int(rgb[2]), int(rgb[1]), int(rgb[0]))
     elif wall_mode == "Wallpaper":
         wall_items = get_wallpapers()
@@ -941,3 +1181,78 @@ with st.expander("Show current object boxes"):
         ), 
         use_container_width=True
     )
+
+# Tab 4: Compare Original & Redesigned
+with tab4:
+    st.header("4. Compare Original & Redesigned")
+    st.caption("Side-by-side comparison of the original photograph and the current redesigned version.")
+    
+    compare_rendered = render_scene(st.session_state.canvas, st.session_state.objects)
+    
+    compare_mode = st.radio(
+        "Comparison mode", 
+        ["Side by side", "Overlay blend", "Difference map"], 
+        horizontal=True,
+        key="compare_mode_radio"
+    )
+    
+    if compare_mode == "Side by side":
+        col_orig, col_new = st.columns(2)
+        with col_orig:
+            st.image(
+                cv2.cvtColor(st.session_state.original, cv2.COLOR_BGR2RGB),
+                caption="Original Wall",
+                use_container_width=True
+            )
+        with col_new:
+            st.image(
+                cv2.cvtColor(compare_rendered, cv2.COLOR_BGR2RGB),
+                caption="Redesigned Wall",
+                use_container_width=True
+            )
+    
+    elif compare_mode == "Overlay blend":
+        blend_alpha = st.slider(
+            "Blend (← Original | Redesigned →)", 
+            0.0, 1.0, 0.5, 0.05,
+            key="compare_blend_slider"
+        )
+        # Matrix operation: weighted addition of two image matrices
+        blended = cv2.addWeighted(
+            st.session_state.original, 1.0 - blend_alpha,
+            compare_rendered, blend_alpha,
+            0
+        )
+        st.image(
+            cv2.cvtColor(blended, cv2.COLOR_BGR2RGB),
+            caption=f"Blend: {int((1-blend_alpha)*100)}% Original / {int(blend_alpha*100)}% Redesigned",
+            use_container_width=True
+        )
+    
+    else:  # Difference map
+        # Matrix operation: absolute difference between two image matrices
+        # highlights every pixel that changed during redesign
+        diff = cv2.absdiff(st.session_state.original, compare_rendered)
+        # Amplify the differences for visibility (matrix scalar multiplication)
+        diff_amplified = np.clip(diff.astype(np.float32) * 3.0, 0, 255).astype(np.uint8)
+        diff_col1, diff_col2 = st.columns(2)
+        with diff_col1:
+            st.image(
+                cv2.cvtColor(diff, cv2.COLOR_BGR2RGB),
+                caption="Raw Difference (darker = less change)",
+                use_container_width=True
+            )
+        with diff_col2:
+            st.image(
+                cv2.cvtColor(diff_amplified, cv2.COLOR_BGR2RGB),
+                caption="Amplified Difference (3× contrast)",
+                use_container_width=True
+            )
+        
+        # Show statistics about changes
+        total_pixels = w * h
+        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        changed_pixels = int(np.count_nonzero(diff_gray > 10))
+        change_pct = (changed_pixels / total_pixels) * 100
+        mean_change = float(np.mean(diff_gray))
+        st.info(f"📊 **Change statistics:** {changed_pixels:,} pixels modified ({change_pct:.1f}% of image) · Mean intensity change: {mean_change:.1f}/255")
