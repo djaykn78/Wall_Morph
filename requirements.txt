@@ -1,0 +1,9 @@
+streamlit>=1.32
+opencv-python-headless>=4.8
+numpy>=1.24
+Pillow>=10.0
+# Automatic detection dependencies (large; install if you want AI detection):
+# torch
+# transformers
+# ultralytics
+streamlit-drawable-canvas>=0.9.3
