@@ -42,7 +42,7 @@ import numbers
 # Add new defaults here only if you want them to appear even before detection.
 OBJECT_TYPES = [
     "door", "window", "table", "bookshelf", "light", "switchboard",
-    "decoration", "wardrobe", "curtain", "bed", "whiteboard",
+    "decoration", "wardrobe", "curtain", "bed", "whiteboard","ground",
 ]
 
 SOURCE_MANUAL = "manual"

@@ -489,35 +489,44 @@ with tab1:
                 update_streamlit=True, 
                 key="manual_object_four_points",
             )
-            point_objects = (point_result.json_data or {}).get("objects", []) if point_result else []
+            point_json = point_result.json_data if point_result else None
+            point_objects = (point_json or {}).get("objects", [])
             points = []
             for pobj in point_objects:
-                if pobj.get("type") in ("circle", "point"):
-                    # Try to get center coordinates robustly
-                    cx, cy = None, None
-                    if "x" in pobj and "y" in pobj:
-                        # Assume x,y are center coordinates
-                        cx = float(pobj["x"])
-                        cy = float(pobj["y"])
-                    elif "left" in pobj and "top" in pobj:
-                        left = float(pobj["left"])
-                        top = float(pobj["top"])
-                        if "radius" in pobj:
-                            # Assume left,top is top-left of bounding box, radius is circle radius
-                            cx = left + float(pobj["radius"])
-                            cy = top + float(pobj["radius"])
-                        elif "width" in pobj and "height" in pobj:
-                            # Assume left,top is top-left, width/height are dimensions
-                            cx = left + float(pobj["width"]) / 2.0
-                            cy = top + float(pobj["height"]) / 2.0
-                        else:
-                            # Fallback: assume left,top are already center coordinates
-                            cx = left
-                            cy = top
-                    if cx is not None and cy is not None:
-                        points.append((cx, cy))
+                if not isinstance(pobj, dict):
+                    continue
+                if str(pobj.get("type", "")).lower() not in ("circle", "point"):
+                    continue
+
+                cx = cy = None
+                # Fabric.js point markers are circles. Their center is derived
+                # from left/top plus the scaled dimensions, not from x/y fields.
+                if "left" in pobj and "top" in pobj:
+                    left = float(pobj["left"])
+                    top = float(pobj["top"])
+                    obj_w = float(pobj.get("width", 0)) * float(pobj.get("scaleX", 1))
+                    obj_h = float(pobj.get("height", 0)) * float(pobj.get("scaleY", 1))
+                    if obj_w > 0 and obj_h > 0:
+                        cx, cy = left + obj_w / 2.0, top + obj_h / 2.0
+                    elif "radius" in pobj:
+                        cx = left + float(pobj["radius"])
+                        cy = top + float(pobj["radius"])
+                    else:
+                        cx, cy = left, top
+                elif "x" in pobj and "y" in pobj:
+                    cx, cy = float(pobj["x"]), float(pobj["y"])
+
+                if cx is not None and cy is not None:
+                    # Ignore malformed/out-of-canvas coordinates.
+                    if -2 <= cx <= point_width + 2 and -2 <= cy <= point_height + 2:
+                        points.append((max(0.0, min(cx, point_width)), max(0.0, min(cy, point_height))))
+
             points = points[-4:]
             st.caption(f"Corner points marked: {len(points)} / 4")
+            if points:
+                st.caption("Canvas point coordinates: " + "; ".join(f"({x:.1f}, {y:.1f})" for x, y in points))
+            if point_result is not None and point_json is None:
+                st.warning("The canvas shows marks but returned no point data. Refresh the page and try again.")
             if len(points) == 4:
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
@@ -525,6 +534,7 @@ with tab1:
                 py1 = max(0, min(h - 1, int(round(min(ys) * h / point_height))))
                 px2 = min(w, max(px1 + 1, int(round(max(xs) * w / point_width))))
                 py2 = min(h, max(py1 + 1, int(round(max(ys) * h / point_height))))
+                st.caption(f"Calculated image box: X={px1}, Y={py1}, Width={px2-px1}, Height={py2-py1} (original image: {w} × {h})")
                 st.image(
                     cv2.cvtColor(
                         render_object_boxes(
